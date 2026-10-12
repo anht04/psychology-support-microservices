@@ -214,25 +214,57 @@ sequenceDiagram
 
 **Trade-off.** A tool or retrieval turn makes several sequential LLM and gRPC calls, so its latency is higher than a plain reply.
 
+**Admission and routing**
+
 ```mermaid
 flowchart TD
-    start(["User message"]) --> guard["Admission check<br/>duplicate throttle + per-session lock"]
-    guard -->|"duplicate, or 2 already pending"| slow(["Return 'sending too fast'"])
-    guard -->|"lock not acquired in 15 s"| busy(["Error: try again later"])
-    guard -->|"accepted"| router["Router LLM<br/>intent + memory flags"]
-    router -->|"intent = tool calling"| tool["Tool-selector LLM<br/>DASS-21 test or relaxation music"]
-    router -->|"other intents"| events["Publish events"]
-    tool --> events
-    events -.->|"MessageProcessed;<br/>UserMemoryCreated if save flag"| mq[["RabbitMQ"]]
-    events --> rag["If personal-memory flag:<br/>UserMemory.SearchMemories<br/>[gRPC, pgvector cosine search]"]
-    rag --> kb["If team-knowledge flag:<br/>inject project knowledge file"]
+    start(["User message"]) --> dup{"Throttled?"}
+    dup -->|yes| slow(["Return: sending too fast"])
+    dup -->|no| lock{"Lock acquired?"}
+    lock -->|no| busy(["Error: try again later"])
+    lock -->|yes| router["Router LLM<br/>classify intent, set flags"]
+    router --> isTool{"Tool intent?"}
+    isTool -->|yes| tool["Tool-selector LLM<br/>DASS-21 test or music"]
+    isTool -->|no| save
+    tool --> save{"Save flag?"}
+    save -->|yes| pubMem["Publish<br/>UserMemoryCreated"]
+    save -->|no| pubProc
+    pubMem --> pubProc["Publish<br/>MessageProcessed"]
+    pubMem -.-> mq[["RabbitMQ"]]
+    pubProc -.-> mq
+    pubProc --> next(["Continue to context assembly"])
+```
+
+**Context assembly and reply**
+
+```mermaid
+flowchart TD
+    start(["From routing"]) --> needMem{"Personal<br/>memory?"}
+    needMem -->|yes| rag["SearchMemories<br/>gRPC to UserMemory<br/>pgvector cosine search"]
+    needMem -->|no| needKb
+    rag --> needKb{"Team<br/>knowledge?"}
+    needKb -->|yes| kb["Inject project<br/>knowledge file"]
+    needKb -->|no| compose
     kb --> compose["Compose instruction<br/>persona + intent + tool guards"]
     compose --> reply["Response LLM"]
     reply --> persist["Persist reply"]
-    persist -->|"14 new messages<br/>since last summary"| summarize["Summarizer LLM<br/>update rolling session summary"]
-    persist -->|"otherwise"| done(["Return reply + optional tool action"])
+    persist --> needSum{"14 new<br/>messages?"}
+    needSum -->|yes| summarize["Summarizer LLM<br/>update session summary"]
+    needSum -->|no| done(["Return reply<br/>+ optional tool action"])
     summarize --> done
 ```
+
+Decision conditions, as implemented in `MessageProcessor`:
+
+| Decision | Condition |
+|---|---|
+| Throttled | The same text is already pending, or the session already has 2 pending messages |
+| Lock acquired | The per-session lock is obtained within 15 s |
+| Tool intent | Router intent is `TOOL_CALLING` |
+| Save flag | Router sets `SaveNeeded` and returns a memory payload |
+| Personal memory | Intent is `RAG_PERSONAL_MEMORY`, or the router sets `UsePersonalMemory` |
+| Team knowledge | Intent is `RAG_TEAM_KNOWLEDGE`, or the router sets `UseTeamKnowledge` |
+| 14 new messages | At least 14 messages since the session's last summary |
 
 The router uses `gemini-2.5-flash-lite` and replies use `gemini-2.5-flash`. UserMemory consumes `UserMemoryCreated`, embeds the memory with `gemini-embedding-001` (3072 dimensions by default) and stores it with emotion, relationship and topic tags. The session lock is held in process memory, so it serialises messages per ChatBox instance.
 
@@ -281,32 +313,44 @@ AIModeration publishes its verdict directly rather than through an outbox.
 
 **Intent.** Rebuilding and restarting every container for a one-service change is slow and widens the blast radius. Both workflows therefore work from the set of changed services.
 
+**Build workflow** (`Build & Push Microservices (GHCR)`)
+
 ```mermaid
-flowchart TB
-    subgraph build["Workflow: Build & Push Microservices (GHCR)"]
-        direction LR
-        trigger(["Push to main<br/>or manual run"]) -->|"manual run, or<br/>shared file changed"| all["All services<br/>in build list"]
-        trigger -->|"otherwise"| map["Map changed paths<br/>to services"]
-        map -->|"none matched"| skip(["Skip build"])
-        map -->|"one or more matched"| matrix["Build matrix<br/>one job per service"]
-        all --> matrix
-        matrix -->|"push tags: SHA,<br/>main, latest"| ghcr[("GHCR")]
-    end
-
-    subgraph deploy["Workflow: Deploy to VPS"]
-        direction LR
-        start2(["Build succeeded<br/>or manual run"]) --> ssh["SSH to VPS: git pull,<br/>diff previous..new commit"]
-        ssh -->|"deploy_all, or<br/>shared file changed"| every["All services"]
-        ssh -->|"otherwise"| changed["Services with<br/>changed paths"]
-        every --> up["docker compose pull<br/>+ up -d per service"]
-        changed --> up
-    end
-
-    matrix -.->|"workflow_run event"| start2
-    ghcr -->|"images pulled by compose"| up
+flowchart TD
+    trigger(["Push to main<br/>or manual run"]) --> manual{"Manual<br/>run?"}
+    manual -->|yes| all["Select all services"]
+    manual -->|no| shared{"Shared file<br/>changed?"}
+    shared -->|yes| all
+    shared -->|no| map["Map changed paths<br/>to services"]
+    map --> any{"Any<br/>match?"}
+    any -->|no| skip(["Skip build"])
+    any -->|yes| runner
+    all --> runner{"Self-hosted<br/>runner free?"}
+    runner -->|yes| selfHosted["Build matrix on<br/>self-hosted runner"]
+    runner -->|no| hosted["Build matrix on<br/>ubuntu-latest"]
+    selfHosted --> push["Push images to GHCR<br/>tags: SHA, main, latest"]
+    hosted --> push
+    push -.->|"workflow_run event"| deployWf(["Deploy workflow"])
 ```
 
-The build workflow treats `Directory.Packages.props`, `nuget.config` and `.dockerignore` as shared files. Build jobs run on the self-hosted runner when it is online and fall back to `ubuntu-latest`.
+**Deploy workflow** (`Deploy to VPS`)
+
+```mermaid
+flowchart TD
+    completed(["Build workflow<br/>completed"]) --> ok{"Build<br/>succeeded?"}
+    ok -->|no| stop(["Skip deploy"])
+    ok -->|yes| ssh
+    manualDeploy(["Manual run<br/>deploy_all, image_tag"]) --> ssh["SSH to VPS: git pull,<br/>diff previous..new commit"]
+    ssh --> force{"deploy_all?"}
+    force -->|yes| every["Select all services"]
+    force -->|no| sharedDeploy{"Shared file<br/>changed?"}
+    sharedDeploy -->|yes| every
+    sharedDeploy -->|no| changed["Map changed paths<br/>to services"]
+    every --> up["Pull images from GHCR<br/>docker compose up -d<br/>per selected service"]
+    changed --> up
+```
+
+"Shared file" means `Directory.Packages.props`, `nuget.config` or `.dockerignore` for the build workflow, and `Directory.Packages.props`, `nuget.config`, `docker-compose-apis.yml` or anything under `BuildingBlocks` for the deploy workflow. The self-hosted runner is used only when it is online and not busy. Deployments triggered by the build use the build's commit SHA as the image tag; manual runs use the `image_tag` input (default `main`).
 
 ## Technology Stack
 
