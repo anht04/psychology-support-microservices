@@ -23,89 +23,128 @@ The backend is split into domain-aligned services behind a YARP API gateway. Ser
 
 ## Engineering Highlights
 
-**Identity isolation at the gateway.** Downstream services never receive the raw account identity. The gateway exchanges each client JWT for a short-lived, per-service token that carries only the identifier that service needs: an alias ID for social services, a patient ID for clinical ones.
+**Identity isolation at the gateway.** Client tokens carry only an opaque subject reference. For each request, the gateway adds the one identifier the destination needs (an alias ID for social services, a patient ID for clinical ones), so services such as Post and Feed work with aliases and never receive a patient ID.
 
-**Reliable event publishing.** Several services (Post, Alias, UserMemory, Wellness, Media and others) write integration events to an **outbox table in the same transaction** as their state change; a background processor publishes them to RabbitMQ. This avoids losing events when the broker is unavailable at commit time.
+**Reliable event publishing.** Several services (Post, Alias, UserMemory, Wellness, Media and others) write integration events to an **outbox table in the same transaction** as their state change; a background processor then publishes them to RabbitMQ. An event is delayed, not lost, if the broker is unavailable at commit time.
 
-**Idempotency and concurrency control.** A shared MediatR pipeline behaviour (`IdempotentCommandPipelineBehaviour`) returns the stored response when a command is retried with the same idempotency key, and Redis-based locks guard hot paths such as adding or removing a reaction on the same target.
+**Idempotency and concurrency control.** A shared MediatR pipeline behaviour (`IdempotentCommandPipelineBehaviour`) returns the stored response when a command is retried with the same idempotency key, and Redis locks serialise reaction changes on the same target.
 
-**AI companion pipeline.** ChatBox runs each message through a Gemini-based router (intent and memory signals), an optional tool selector, memory retrieval from UserMemory over gRPC and a final generation step. Long-term memories are embedded with `gemini-embedding-001` and searched in **PostgreSQL + pgvector** using cosine distance.
+**Multi-stage LLM pipeline.** ChatBox routes each message with a lightweight Gemini call, runs a tool-selector call only for tool intents, retrieves memories from UserMemory over gRPC only when needed, and composes an intent-specific instruction for the final response model.
 
-**AI moderation in the event flow.** New posts are moderated asynchronously: Post publishes `PostCreated`, AIModeration evaluates it with Gemini and publishes the verdict, and both Post (approve / reject) and Feed (fan-out of approved posts) react to it.
+**AI moderation in the event flow.** New posts are moderated asynchronously: Post publishes `PostCreated`, AIModeration evaluates it with Gemini and publishes the verdict, and both Post (approve or reject) and Feed (index approved posts) react to it.
 
-**Selective CI/CD.** GitHub Actions maps changed paths to services, builds a matrix of Docker images only for those services, pushes them to GHCR, and redeploys only the affected containers on the VPS through Docker Compose.
+**Selective CI/CD.** GitHub Actions maps changed paths to services, builds Docker images only for those services, pushes them to GHCR and redeploys only the affected containers on the VPS.
 
 ## Architecture
 
+The diagrams follow the [C4 model](https://c4model.com/): a System Context view for people and external systems, then a Container view for the services inside the system. They are drawn as Mermaid flowcharts using C4 notation (element type in brackets, technology on each relationship) because Mermaid's native C4 syntax is experimental and lays out labels poorly on GitHub.
+
+**Legend (all diagrams):** solid arrow = synchronous call or dependency (HTTP, gRPC, SignalR, database access); dashed arrow = asynchronous message or trigger (RabbitMQ event, workflow trigger). In sequence diagrams, `-)` open arrows are asynchronous messages and dashed arrows are replies.
+
+### System context
+
 ```mermaid
 flowchart TB
-    Client["Web / Mobile clients"]
-    GW["YARP API Gateway<br/>routing · JWT validation · token exchange · rate limiting"]
+    user["User<br/>[Person]<br/>Chats with the AI companion, posts<br/>anonymously, takes assessments"]
+    doctor["Doctor<br/>[Person]<br/>Maintains a professional profile"]
+    staff["Admin / Manager<br/>[Person]<br/>Manages tests, media and payments"]
 
-    subgraph Services["Microservices (ASP.NET Core, one database each)"]
-        direction LR
-        subgraph Identity["Identity"]
-            Auth["Auth"]
-            Profile["Profile<br/>PII owner maps"]
-            Alias["Alias"]
-        end
-        subgraph Social["Community"]
-            Post["Post"]
-            Feed["Feed"]
-            Media["Media"]
-            Mod["AIModeration"]
-        end
-        subgraph AI["AI companion"]
-            Chat["ChatBox<br/>SignalR hub"]
-            Mem["UserMemory"]
-            RT["RealtimeHub<br/>SignalR hub"]
-        end
-        subgraph Care["Care & commerce"]
-            Test["Test (DASS-21)"]
-            Well["Wellness"]
-            Sub["Subscription"]
-            Promo["Promotion"]
-            Pay["Payment"]
-            DG["DigitalGoods"]
-            Trans["Translation"]
-        end
-    end
+    emo["EmoEase backend<br/>[Software system]<br/>Psychology Support Microservices"]
 
-    MQ[["RabbitMQ (MassTransit)"]]
+    gemini["Google Gemini API<br/>[External system]"]
+    firebase["Firebase<br/>[External system]"]
+    pay["PayOS and VNPay<br/>[External system]"]
+    blob["Azure Blob Storage<br/>[External system]"]
+    sight["Sightengine<br/>[External system]"]
+    smtp["SMTP server<br/>[External system]"]
 
-    subgraph Data["Data stores"]
-        direction LR
-        PG[("PostgreSQL<br/>+ pgvector")]
-        Scylla[("ScyllaDB")]
-        Redis[("Redis")]
-    end
+    user -->|"Uses<br/>[HTTPS, WebSocket]"| emo
+    doctor -->|"Uses<br/>[HTTPS]"| emo
+    staff -->|"Uses<br/>[HTTPS]"| emo
 
-    Ext(["Gemini · PayOS / VNPay · Firebase · Azure Blob · Sightengine"])
+    emo -->|"Generates replies, embeddings,<br/>moderation verdicts, images<br/>[HTTPS]"| gemini
+    emo -->|"Verifies ID tokens,<br/>sends push messages<br/>[Firebase Admin SDK]"| firebase
+    emo -->|"Creates payment links<br/>[HTTPS]"| pay
+    pay -->|"Payment callbacks<br/>[HTTPS webhook]"| emo
+    emo -->|"Stores media<br/>[HTTPS]"| blob
+    emo -->|"Moderates images<br/>[HTTPS]"| sight
+    emo -->|"Sends email<br/>[SMTP]"| smtp
 
-    Client -->|"HTTPS + SignalR"| GW
-    GW -->|"HTTP / WebSocket"| Services
-    GW -->|"gRPC: resolve IDs"| Profile
-    Chat -->|"gRPC: search memories"| Mem
-    Alias -->|"gRPC: validate label"| Mod
-    Sub -->|gRPC| Promo
-    Services -.->|"integration events"| MQ
-    Services --- Data
-    Feed --- Scylla
-    Services --> Ext
+    classDef person fill:#08427b,stroke:#052e56,color:#ffffff
+    classDef system fill:#1168bd,stroke:#0b4884,color:#ffffff
+    classDef external fill:#6b6b6b,stroke:#4d4d4d,color:#ffffff
+    class user,doctor,staff person
+    class emo system
+    class gemini,firebase,pay,blob,sight,smtp external
 ```
 
-Solid arrows are synchronous calls (HTTP, gRPC, or SignalR proxied by the gateway); the dotted arrow is asynchronous messaging over RabbitMQ. Each service owns its own PostgreSQL database (Feed uses ScyllaDB), and Translation is called over gRPC by several services. The diagram shows the services deployed by `docker-compose-apis.yml`; the solution contains a few more services that are not part of that deployment (see below).
+Users reach the backend through Android, iOS and web clients (the `DeviceType` values in Auth); those clients live outside this repository.
+
+### Containers
+
+```mermaid
+flowchart TB
+    apps["Mobile and web apps<br/>[Container: outside this repo]"]
+
+    subgraph emo["EmoEase backend"]
+        gw["API Gateway<br/>[Container: ASP.NET Core, YARP]<br/>Routing, auth, token exchange, rate limiting"]
+
+        subgraph domain["Domain services [Containers: ASP.NET Core]"]
+            auth["Auth"]
+            alias["Alias"]
+            post["Post"]
+            feed["Feed"]
+            media["Media"]
+            mod["AIModeration"]
+            chat["ChatBox"]
+            mem["UserMemory"]
+            rt["RealtimeHub"]
+            care["Care and commerce:<br/>Test, Wellness, Subscription,<br/>Promotion, Payment, DigitalGoods"]
+        end
+
+        subgraph shared["Shared gRPC services"]
+            profile["Profile<br/>[Container]<br/>Identity mapping, persona"]
+            trans["Translation<br/>[Container]"]
+            notif["Notification<br/>[Container: hosted separately]"]
+        end
+
+        subgraph infra["Data stores and messaging"]
+            direction LR
+            mq[["RabbitMQ<br/>[Message broker]"]]
+            pg[("PostgreSQL + pgvector<br/>[Database per service]")]
+            scylla[("ScyllaDB<br/>[Feed read model]")]
+            redis[("Redis<br/>[Cache, locks,<br/>idempotency keys]")]
+        end
+    end
+
+    apps -->|"API calls and SignalR hubs<br/>[HTTPS, WebSocket]"| gw
+    gw -->|"Proxies requests with scoped token<br/>[HTTP, WebSocket]"| domain
+    gw -->|"Resolves alias / patient / user IDs<br/>[gRPC]"| profile
+
+    domain -->|"Identity and persona lookups,<br/>translation, email<br/>[gRPC]"| shared
+    chat <-->|"Memory search, session summaries<br/>[gRPC]"| mem
+    alias -->|"Validates alias labels<br/>[gRPC]"| mod
+
+    domain -.->|"Publishes and consumes<br/>integration events [AMQP]"| mq
+    notif -.->|"Consumes email and<br/>notification events [AMQP]"| mq
+
+    domain -->|"Reads and writes<br/>[EF Core]"| pg
+    feed -->|"Reads and writes<br/>[CQL]"| scylla
+    domain -->|"Caches, locks<br/>[Redis]"| redis
+```
+
+The gateway, the services in the first group, Profile and Translation are defined in `docker-compose-apis.yml`. Notification is not part of that file; Auth's compose configuration points its gRPC client at a separately hosted instance.
 
 ## Services
 
 | Service | Responsibility | Main technologies |
 |---|---|---|
-| **YarpApiGateway** | Single entry point; per-service route files, JWT validation, token exchange, fixed-window rate limiting | YARP, gRPC client, Redis |
+| **YarpApiGateway** | Single entry point; per-service route files, JWT authentication, token exchange, fixed-window rate limiting | YARP, gRPC client, Redis |
 | **Auth** | Registration, login (incl. Firebase ID-token login), JWT issuing, refresh and revocation, device sessions | ASP.NET Core Identity, PostgreSQL, Redis |
-| **Profile** | Person, patient and doctor profiles, medical history; owns subject-to-alias/patient/user mappings and serves them over gRPC | PostgreSQL, gRPC |
+| **Profile** | Person, patient and doctor profiles, medical history; owns subject-to-alias/patient/user mappings and serves them and persona snapshots over gRPC | PostgreSQL, gRPC |
 | **Alias** | Anonymous public identities, alias labels, follow relationships, audit trail | PostgreSQL, Redis, outbox |
 | **Post** | Posts, nested comments, reactions, gifts and tags; moderation state | PostgreSQL, Redis locks, outbox, DDD layers |
-| **Feed** | Per-user timelines built by fan-out of approved posts, ranking and trending | ScyllaDB, Redis |
+| **Feed** | Feed read model of approved posts, follower timelines, ranking and trending | ScyllaDB, Redis |
 | **AIModeration** | Moderates post content and alias labels | Gemini, PostgreSQL, gRPC |
 | **Media** | Media uploads, image moderation, AI-generated reward stickers | Azure Blob Storage, Sightengine, Gemini |
 | **ChatBox** | AI companion sessions: routing, tool selection, generation, rolling session summaries | Gemini, SignalR, PostgreSQL |
@@ -113,72 +152,161 @@ Solid arrows are synchronous calls (HTTP, gRPC, or SignalR proxied by the gatewa
 | **RealtimeHub** | Pushes notifications, reward and progress updates to connected clients | SignalR, MassTransit consumers |
 | **Test** | DASS-21 psychological self-assessments | PostgreSQL |
 | **Wellness** | Wellness modules, challenges, mood journaling | PostgreSQL, outbox |
-| **Subscription** | Service packages and user subscriptions | PostgreSQL, gRPC client |
+| **Subscription** | Service packages and user subscriptions; calls Promotion over gRPC | PostgreSQL, gRPC client |
 | **Promotion** | Promo and gift codes, exposed as a gRPC service | gRPC, PostgreSQL |
 | **Payment** | Payment links and webhooks for subscriptions and bookings | PayOS, VNPay |
 | **DigitalGoods** | Digital goods catalogue and inventory grants | PostgreSQL, outbox |
 | **Translation** | Content translation exposed over gRPC | Gemini, PostgreSQL |
+| **Notification** | In-app, push and email notifications; merges repeated alerts; gRPC email API | PostgreSQL, Firebase Cloud Messaging, SMTP |
 
 > [!NOTE]
-> `Notification`, `Conversation`, `Scheduling`, `LifeStyles`, `Billing`, `Image` and `Wallet` also exist under `Services/`, but they are not included in `docker-compose-apis.yml` or the CI build matrix.
+> `Conversation`, `Scheduling`, `LifeStyles`, `Billing`, `Image` and `Wallet` also exist under `Services/`, but they are not part of `docker-compose-apis.yml` or the CI build matrix.
 
 ## Key Workflows
 
-### 1. Token exchange and identity isolation
+Each workflow starts with the design intent as reflected in the code, followed by the implemented behaviour.
 
-**Problem.** Social services must not be able to link a public alias back to an account or to clinical data.
+### 1. Token exchange
 
-**Implementation.** For each proxied request, a YARP request transform (`TokenExchangeTransformFactory`) reads the incoming token's subject, looks up the identifiers required by the destination service (`TokenExchangeRuleRegistry`), resolves them through Profile's gRPC PII service, and mints a new RSA-signed token for that audience. Minted tokens are cached in memory for 15 minutes; ID lookups are cached in Redis with a 1-hour sliding expiration, and each lookup has a 10-second timeout.
+**Intent.** Social services should be able to identify an author without being able to link that alias to a patient record. Only the gateway and Profile handle the subject-to-alias/patient mapping, so it happens once per request at the edge.
+
+**Trade-off.** Every authenticated request depends on the gateway and on Profile for ID resolution. Two caches keep that cost off the hot path: Redis for ID lookups (1-hour sliding expiration) and an in-memory cache for minted tokens (15 minutes, the token lifetime).
 
 ```mermaid
 sequenceDiagram
-    participant C as Client
-    participant G as YARP Gateway
+    autonumber
+    participant App as Client app
+    participant GW as API Gateway
     participant R as Redis
-    participant P as Profile (gRPC)
-    participant S as Downstream service
-    C->>G: Request + user JWT
-    G->>R: Cached alias/patient ID?
-    alt cache miss
-        G->>P: ResolveAliasIdBySubjectRef / ResolvePatientIdBySubjectRef
-        P-->>G: ID
-        G->>R: Cache (1h sliding)
+    participant P as Profile
+    participant S as Destination service
+
+    App->>GW: HTTPS request (Bearer client JWT)
+    GW->>GW: Read subject reference, match rules for destination
+    alt No rule matches the destination
+        GW->>S: Forward with original token
+        S-->>GW: Response
+        GW-->>App: Response
+    else Rules match
+        loop Each required ID, in parallel, 10 s timeout
+            GW->>R: Get cached ID
+            R-->>GW: Hit or miss
+            opt Cache miss
+                GW->>P: Resolve ID by subject reference (gRPC)
+                P-->>GW: ID
+                GW->>R: Cache ID (1 h sliding)
+            end
+        end
+        alt A required ID is missing
+            GW-->>App: 403 PROFILE_INCOMPLETE
+        else All IDs resolved
+            GW->>GW: Mint RS256 token for this audience (cached 15 min)
+            GW->>S: Forward with scoped token
+            S-->>GW: Response
+            GW-->>App: Response
+        end
     end
-    G->>G: Mint audience-specific JWT (15 min)
-    G->>S: Forward request with internal token
 ```
 
-**Trade-off.** Every request depends on the gateway and on Profile for ID resolution; the two cache layers keep that cost off the hot path.
+### 2. AI companion: multi-stage LLM pipeline
 
-### 2. AI companion message processing
+**Intent.** A single large prompt would pay for retrieval and tool reasoning on every message. Splitting the turn into a cheap router call followed by optional steps keeps simple messages cheap and fast.
 
-1. ChatBox serialises processing per chat session, then prefixes the message with date/time context.
-2. `GeminiRouterClient` returns an intent (conversation, safety refusal, personal-memory retrieval, team-knowledge retrieval or tool calling) plus a decision on whether the message should be saved as a memory.
-3. For tool intents, `GeminiToolSelectorClient` chooses a tool (e.g. starting a DASS-21 test or playing relaxation music).
-4. When retrieval is needed, ChatBox calls UserMemory's `SearchMemories` gRPC method, which ranks stored memories by cosine distance in pgvector.
-5. Memories marked for saving are published as `UserMemoryCreatedIntegrationEvent`; UserMemory embeds them (`gemini-embedding-001`, 3072 dimensions by default) and stores them with emotion, relationship and topic tags.
-6. The reply is generated with Gemini and persisted. Once 14 new messages accumulate, ChatBox summarises them into the session's rolling summary, which is used as context for later turns.
+**Trade-off.** A tool or retrieval turn makes several sequential LLM and gRPC calls, so its latency is higher than a plain reply.
 
-A `MessageProcessedIntegrationEvent` also updates the user's reward points in UserMemory; claimed rewards are processed by a Quartz job that asks Media to generate a sticker image, and RealtimeHub notifies the client.
+```mermaid
+flowchart TD
+    start(["User message"]) --> guard["Admission check<br/>duplicate throttle + per-session lock"]
+    guard -->|"duplicate, or 2 already pending"| slow(["Return 'sending too fast'"])
+    guard -->|"lock not acquired in 15 s"| busy(["Error: try again later"])
+    guard -->|"accepted"| router["Router LLM<br/>intent + memory flags"]
+    router -->|"intent = tool calling"| tool["Tool-selector LLM<br/>DASS-21 test or relaxation music"]
+    router -->|"other intents"| events["Publish events"]
+    tool --> events
+    events -.->|"MessageProcessed;<br/>UserMemoryCreated if save flag"| mq[["RabbitMQ"]]
+    events --> rag["If personal-memory flag:<br/>UserMemory.SearchMemories<br/>[gRPC, pgvector cosine search]"]
+    rag --> kb["If team-knowledge flag:<br/>inject project knowledge file"]
+    kb --> compose["Compose instruction<br/>persona + intent + tool guards"]
+    compose --> reply["Response LLM"]
+    reply --> persist["Persist reply"]
+    persist -->|"14 new messages<br/>since last summary"| summarize["Summarizer LLM<br/>update rolling session summary"]
+    persist -->|"otherwise"| done(["Return reply + optional tool action"])
+    summarize --> done
+```
 
-### 3. Event-driven post moderation with the outbox pattern
+The router uses `gemini-2.5-flash-lite` and replies use `gemini-2.5-flash`. UserMemory consumes `UserMemoryCreated`, embeds the memory with `gemini-embedding-001` (3072 dimensions by default) and stores it with emotion, relationship and topic tags. The session lock is held in process memory, so it serialises messages per ChatBox instance.
+
+### 3. Event-driven post moderation
+
+**Intent.** Moderation calls an external LLM and can be slow, so it runs outside the create-post request. The outbox makes the hand-off reliable: the post and its `PostCreated` event are committed together.
+
+**Trade-off.** Delivery is at-least-once and the post becomes public only after moderation completes, so consumers must tolerate duplicates and clients see a pending state first.
 
 ```mermaid
 sequenceDiagram
-    participant Post
+    autonumber
+    participant App as Client app
+    participant Post as Post API
+    participant DB as Post database
+    participant OP as Post outbox processor
     participant MQ as RabbitMQ
     participant Mod as AIModeration
+    participant Gem as Gemini API
     participant Feed
-    Post->>Post: Save post + outbox row (one transaction)
-    Post-->>MQ: OutboxProcessor publishes PostCreated
-    MQ-->>Mod: PostCreated
-    Mod->>Mod: Moderate content with Gemini
-    Mod-->>MQ: PostModerationEvaluated
-    MQ-->>Post: Approve or reject post
-    MQ-->>Feed: Fan out approved post to follower timelines
+
+    App->>Post: Create post (via gateway)
+    Post->>DB: Save post (pending moderation) + outbox row, one transaction
+    Post-->>App: Post ID, moderation status Pending
+    loop Every 5 s
+        OP->>DB: Read up to 100 unprocessed rows
+        OP-)MQ: Publish PostCreated
+        OP->>DB: Mark rows processed
+    end
+    MQ-)Mod: PostCreated
+    Mod->>Gem: Moderate title and content
+    Gem-->>Mod: Verdict
+    Mod-)MQ: Publish PostModerationEvaluated
+    par Post updates its aggregate
+        MQ-)Post: PostModerationEvaluated
+        Post->>DB: Approve or reject post
+    and Feed updates its read model
+        MQ-)Feed: PostModerationEvaluated
+        Feed->>Feed: If approved, add post to ScyllaDB replica tables
+    end
 ```
 
-Post's `OutboxProcessor` is a `BackgroundService` that polls unprocessed rows in batches of 100 and marks them processed after publishing. Because the outbox row is written in the same transaction as the post, a crash between commit and publish delays the event instead of losing it; consumers must therefore tolerate duplicates.
+AIModeration publishes its verdict directly rather than through an outbox.
+
+### 4. Selective build and deployment
+
+**Intent.** Rebuilding and restarting every container for a one-service change is slow and widens the blast radius. Both workflows therefore work from the set of changed services.
+
+```mermaid
+flowchart TB
+    subgraph build["Workflow: Build & Push Microservices (GHCR)"]
+        direction LR
+        trigger(["Push to main<br/>or manual run"]) -->|"manual run, or<br/>shared file changed"| all["All services<br/>in build list"]
+        trigger -->|"otherwise"| map["Map changed paths<br/>to services"]
+        map -->|"none matched"| skip(["Skip build"])
+        map -->|"one or more matched"| matrix["Build matrix<br/>one job per service"]
+        all --> matrix
+        matrix -->|"push tags: SHA,<br/>main, latest"| ghcr[("GHCR")]
+    end
+
+    subgraph deploy["Workflow: Deploy to VPS"]
+        direction LR
+        start2(["Build succeeded<br/>or manual run"]) --> ssh["SSH to VPS: git pull,<br/>diff previous..new commit"]
+        ssh -->|"deploy_all, or<br/>shared file changed"| every["All services"]
+        ssh -->|"otherwise"| changed["Services with<br/>changed paths"]
+        every --> up["docker compose pull<br/>+ up -d per service"]
+        changed --> up
+    end
+
+    matrix -.->|"workflow_run event"| start2
+    ghcr -->|"images pulled by compose"| up
+```
+
+The build workflow treats `Directory.Packages.props`, `nuget.config` and `.dockerignore` as shared files. Build jobs run on the self-hosted runner when it is online and fall back to `ubuntu-latest`.
 
 ## Technology Stack
 
