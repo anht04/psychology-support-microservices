@@ -214,45 +214,59 @@ sequenceDiagram
 
 **Trade-off.** A tool or retrieval turn makes several sequential LLM and gRPC calls, so its latency is higher than a plain reply.
 
-**Admission and routing**
-
 ```mermaid
-flowchart TD
-    start(["User message"]) --> dup{"Throttled?"}
-    dup -->|yes| slow(["Return: sending too fast"])
-    dup -->|no| lock{"Lock acquired?"}
-    lock -->|no| busy(["Error: try again later"])
-    lock -->|yes| router["Router LLM<br/>classify intent, set flags"]
-    router --> isTool{"Tool intent?"}
-    isTool -->|yes| tool["Tool-selector LLM<br/>DASS-21 test or music"]
-    isTool -->|no| save
-    tool --> save{"Save flag?"}
-    save -->|yes| pubMem["Publish<br/>UserMemoryCreated"]
-    save -->|no| pubProc
-    pubMem --> pubProc["Publish<br/>MessageProcessed"]
-    pubMem -.-> mq[["RabbitMQ"]]
-    pubProc -.-> mq
-    pubProc --> next(["Continue to context assembly"])
+%%{init: {"flowchart": {"padding": 4, "rankSpacing": 30, "nodeSpacing": 25}}}%%
+flowchart TB
+    subgraph admission["Step 1 · Admission"]
+        direction LR
+        start(["User message"]) --> dup{"Throttled?"}
+        dup -->|yes| slow(["Return:<br/>sending too fast"])
+        dup -->|no| lock{"Lock<br/>acquired?"}
+        lock -->|no| busy(["Error:<br/>try again later"])
+        lock -->|yes| outA(["▶ Step 2<br/>Routing and events"])
+    end
+
+    subgraph routing["Step 2 · Routing and events"]
+        direction LR
+        inA(["From step 1<br/>Admission ▶"]) --> router["Router LLM<br/>intent + flags"]
+        router --> isTool{"Tool<br/>intent?"}
+        isTool -->|yes| tool["Tool-selector LLM<br/>DASS-21 or music"]
+        isTool -->|no| save{"Save<br/>flag?"}
+        tool --> save
+        save -->|yes| pubMem["Publish<br/>UserMemoryCreated"]
+        save -->|no| pubProc["Publish<br/>MessageProcessed"]
+        pubMem --> pubProc
+        pubMem -.-> mq[["RabbitMQ"]]
+        pubProc -.-> mq
+        pubProc --> outB(["▶ Step 3<br/>Context assembly"])
+    end
+
+    subgraph context["Step 3 · Context assembly"]
+        direction LR
+        inB(["From step 2<br/>Routing ▶"]) --> needMem{"Personal<br/>memory?"}
+        needMem -->|yes| rag["SearchMemories<br/>gRPC · pgvector"]
+        needMem -->|no| needKb{"Team<br/>knowledge?"}
+        rag --> needKb
+        needKb -->|yes| kb["Inject project<br/>knowledge file"]
+        needKb -->|no| compose["Compose<br/>instruction"]
+        kb --> compose
+        compose --> outC(["▶ Step 4<br/>Reply"])
+    end
+
+    subgraph answer["Step 4 · Reply"]
+        direction LR
+        inC(["From step 3<br/>Context ▶"]) --> reply["Response LLM"]
+        reply --> persist["Persist reply"]
+        persist --> needSum{"14 new<br/>messages?"}
+        needSum -->|yes| summarize["Summarizer LLM<br/>update summary"]
+        needSum -->|no| done(["Return reply<br/>+ tool action"])
+        summarize --> done
+    end
+
+    admission --> routing --> context --> answer
 ```
 
-**Context assembly and reply**
-
-```mermaid
-flowchart TD
-    start(["From routing"]) --> needMem{"Personal<br/>memory?"}
-    needMem -->|yes| rag["SearchMemories<br/>gRPC to UserMemory<br/>pgvector cosine search"]
-    needMem -->|no| needKb
-    rag --> needKb{"Team<br/>knowledge?"}
-    needKb -->|yes| kb["Inject project<br/>knowledge file"]
-    needKb -->|no| compose
-    kb --> compose["Compose instruction<br/>persona + intent + tool guards"]
-    compose --> reply["Response LLM"]
-    reply --> persist["Persist reply"]
-    persist --> needSum{"14 new<br/>messages?"}
-    needSum -->|yes| summarize["Summarizer LLM<br/>update session summary"]
-    needSum -->|no| done(["Return reply<br/>+ optional tool action"])
-    summarize --> done
-```
+Read each step left to right. The terminal at the end of each step names the step that follows; that step starts at its "From step" terminal.
 
 Decision conditions, as implemented in `MessageProcessor`:
 
@@ -313,41 +327,42 @@ AIModeration publishes its verdict directly rather than through an outbox.
 
 **Intent.** Rebuilding and restarting every container for a one-service change is slow and widens the blast radius. Both workflows therefore work from the set of changed services.
 
-**Build workflow** (`Build & Push Microservices (GHCR)`)
-
 ```mermaid
-flowchart TD
-    trigger(["Push to main<br/>or manual run"]) --> manual{"Manual<br/>run?"}
-    manual -->|yes| all["Select all services"]
-    manual -->|no| shared{"Shared file<br/>changed?"}
-    shared -->|yes| all
-    shared -->|no| map["Map changed paths<br/>to services"]
-    map --> any{"Any<br/>match?"}
-    any -->|no| skip(["Skip build"])
-    any -->|yes| runner
-    all --> runner{"Self-hosted<br/>runner free?"}
-    runner -->|yes| selfHosted["Build matrix on<br/>self-hosted runner"]
-    runner -->|no| hosted["Build matrix on<br/>ubuntu-latest"]
-    selfHosted --> push["Push images to GHCR<br/>tags: SHA, main, latest"]
-    hosted --> push
-    push -.->|"workflow_run event"| deployWf(["Deploy workflow"])
-```
+%%{init: {"flowchart": {"padding": 4, "rankSpacing": 30, "nodeSpacing": 25}}}%%
+flowchart TB
+    subgraph build["Workflow 1 · Build & Push Microservices (GHCR)"]
+        direction LR
+        trigger(["Push to main<br/>or manual run"]) --> manual{"Manual<br/>run?"}
+        manual -->|yes| all["Select all<br/>services"]
+        manual -->|no| shared{"Shared file<br/>changed?"}
+        shared -->|yes| all
+        shared -->|no| map["Map changed<br/>paths to services"]
+        map --> any{"Any<br/>match?"}
+        any -->|no| skip(["Skip build"])
+        any -->|yes| runner{"Self-hosted<br/>runner free?"}
+        all --> runner
+        runner -->|yes| selfHosted["Build on<br/>self-hosted runner"]
+        runner -->|no| hosted["Build on<br/>ubuntu-latest"]
+        selfHosted --> push["Push images to GHCR<br/>SHA · main · latest"]
+        hosted --> push
+    end
 
-**Deploy workflow** (`Deploy to VPS`)
+    subgraph deploy["Workflow 2 · Deploy to VPS"]
+        direction LR
+        completed(["Build workflow<br/>completed"]) --> ok{"Build<br/>succeeded?"}
+        ok -->|no| stop(["Skip deploy"])
+        ok -->|yes| ssh["SSH to VPS: git pull,<br/>diff previous..new"]
+        manualDeploy(["Manual run<br/>deploy_all, image_tag"]) --> ssh
+        ssh --> force{"deploy_all?"}
+        force -->|yes| every["Select all<br/>services"]
+        force -->|no| sharedDeploy{"Shared file<br/>changed?"}
+        sharedDeploy -->|yes| every
+        sharedDeploy -->|no| changed["Map changed<br/>paths to services"]
+        every --> up["Pull images from GHCR<br/>compose up -d per service"]
+        changed --> up
+    end
 
-```mermaid
-flowchart TD
-    completed(["Build workflow<br/>completed"]) --> ok{"Build<br/>succeeded?"}
-    ok -->|no| stop(["Skip deploy"])
-    ok -->|yes| ssh
-    manualDeploy(["Manual run<br/>deploy_all, image_tag"]) --> ssh["SSH to VPS: git pull,<br/>diff previous..new commit"]
-    ssh --> force{"deploy_all?"}
-    force -->|yes| every["Select all services"]
-    force -->|no| sharedDeploy{"Shared file<br/>changed?"}
-    sharedDeploy -->|yes| every
-    sharedDeploy -->|no| changed["Map changed paths<br/>to services"]
-    every --> up["Pull images from GHCR<br/>docker compose up -d<br/>per selected service"]
-    changed --> up
+    build -.->|"workflow_run event"| deploy
 ```
 
 "Shared file" means `Directory.Packages.props`, `nuget.config` or `.dockerignore` for the build workflow, and `Directory.Packages.props`, `nuget.config`, `docker-compose-apis.yml` or anything under `BuildingBlocks` for the deploy workflow. The self-hosted runner is used only when it is online and not busy. Deployments triggered by the build use the build's commit SHA as the image tag; manual runs use the `image_tag` input (default `main`).
