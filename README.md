@@ -44,6 +44,7 @@ The diagrams follow the [C4 model](https://c4model.com/): a System Context view 
 ### System context
 
 ```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 400}}}%%
 flowchart TB
     user["User<br/>[Person]<br/>Chats with the AI companion, posts<br/>anonymously, takes assessments"]
     doctor["Doctor<br/>[Person]<br/>Maintains a professional profile"]
