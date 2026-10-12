@@ -1,0 +1,292 @@
+# Psychology Support Microservices
+
+Backend for **EmoEase**, a mental-health support platform that combines an AI companion chat, an anonymous peer-support community and self-assessment tools, built as a set of .NET microservices.
+
+![.NET 9](https://img.shields.io/badge/.NET-9.0-512BD4?logo=dotnet&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-pgvector-4169E1?logo=postgresql&logoColor=white)
+![RabbitMQ](https://img.shields.io/badge/RabbitMQ-MassTransit-FF6600?logo=rabbitmq&logoColor=white)
+![Redis](https://img.shields.io/badge/Redis-cache%20%26%20locks-DC382D?logo=redis&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
+
+📖 In-depth architecture documentation: **[DeepWiki](https://deepwiki.com/anht04/psychology-support-microservices)**
+
+## Overview
+
+People looking for emotional support often want two things that pull in opposite directions: a personalised experience (an assistant that remembers them) and strong anonymity (a community where nobody can link a post to their real identity or health data). EmoEase addresses both:
+
+- **AI companion** that classifies each message, retrieves relevant long-term memories and can trigger in-app tools such as a DASS-21 assessment.
+- **Anonymous community** with posts, nested comments, reactions and a personalised feed, where users act through public *aliases* instead of their account.
+- **Clinical and wellness features**: patient profiles, DASS-21 self-assessments, wellness modules, challenges and mood journaling.
+- **Commerce**: subscription packages, promo and gift codes, digital goods and PayOS / VNPay payments.
+
+The backend is split into domain-aligned services behind a YARP API gateway. Services own their data, communicate synchronously over gRPC where an immediate answer is needed, and asynchronously over RabbitMQ (MassTransit) for everything else. The CI pipeline builds and deploys only the services whose files changed.
+
+## Engineering Highlights
+
+**Identity isolation at the gateway.** Downstream services never receive the raw account identity. The gateway exchanges each client JWT for a short-lived, per-service token that carries only the identifier that service needs: an alias ID for social services, a patient ID for clinical ones.
+
+**Reliable event publishing.** Several services (Post, Alias, UserMemory, Wellness, Media and others) write integration events to an **outbox table in the same transaction** as their state change; a background processor publishes them to RabbitMQ. This avoids losing events when the broker is unavailable at commit time.
+
+**Idempotency and concurrency control.** A shared MediatR pipeline behaviour (`IdempotentCommandPipelineBehaviour`) returns the stored response when a command is retried with the same idempotency key, and Redis-based locks guard hot paths such as adding or removing a reaction on the same target.
+
+**AI companion pipeline.** ChatBox runs each message through a Gemini-based router (intent and memory signals), an optional tool selector, memory retrieval from UserMemory over gRPC and a final generation step. Long-term memories are embedded with `gemini-embedding-001` and searched in **PostgreSQL + pgvector** using cosine distance.
+
+**AI moderation in the event flow.** New posts are moderated asynchronously: Post publishes `PostCreated`, AIModeration evaluates it with Gemini and publishes the verdict, and both Post (approve / reject) and Feed (fan-out of approved posts) react to it.
+
+**Selective CI/CD.** GitHub Actions maps changed paths to services, builds a matrix of Docker images only for those services, pushes them to GHCR, and redeploys only the affected containers on the VPS through Docker Compose.
+
+## Architecture
+
+```mermaid
+flowchart TB
+    Client["Web / Mobile clients"]
+    GW["YARP API Gateway<br/>routing · JWT validation · token exchange · rate limiting"]
+
+    subgraph Services["Microservices (ASP.NET Core, one database each)"]
+        direction LR
+        subgraph Identity["Identity"]
+            Auth["Auth"]
+            Profile["Profile<br/>PII owner maps"]
+            Alias["Alias"]
+        end
+        subgraph Social["Community"]
+            Post["Post"]
+            Feed["Feed"]
+            Media["Media"]
+            Mod["AIModeration"]
+        end
+        subgraph AI["AI companion"]
+            Chat["ChatBox<br/>SignalR hub"]
+            Mem["UserMemory"]
+            RT["RealtimeHub<br/>SignalR hub"]
+        end
+        subgraph Care["Care & commerce"]
+            Test["Test (DASS-21)"]
+            Well["Wellness"]
+            Sub["Subscription"]
+            Promo["Promotion"]
+            Pay["Payment"]
+            DG["DigitalGoods"]
+            Trans["Translation"]
+        end
+    end
+
+    MQ[["RabbitMQ (MassTransit)"]]
+
+    subgraph Data["Data stores"]
+        direction LR
+        PG[("PostgreSQL<br/>+ pgvector")]
+        Scylla[("ScyllaDB")]
+        Redis[("Redis")]
+    end
+
+    Ext(["Gemini · PayOS / VNPay · Firebase · Azure Blob · Sightengine"])
+
+    Client -->|"HTTPS + SignalR"| GW
+    GW -->|"HTTP / WebSocket"| Services
+    GW -->|"gRPC: resolve IDs"| Profile
+    Chat -->|"gRPC: search memories"| Mem
+    Alias -->|"gRPC: validate label"| Mod
+    Sub -->|gRPC| Promo
+    Services -.->|"integration events"| MQ
+    Services --- Data
+    Feed --- Scylla
+    Services --> Ext
+```
+
+Solid arrows are synchronous calls (HTTP, gRPC, or SignalR proxied by the gateway); the dotted arrow is asynchronous messaging over RabbitMQ. Each service owns its own PostgreSQL database (Feed uses ScyllaDB), and Translation is called over gRPC by several services. The diagram shows the services deployed by `docker-compose-apis.yml`; the solution contains a few more services that are not part of that deployment (see below).
+
+## Services
+
+| Service | Responsibility | Main technologies |
+|---|---|---|
+| **YarpApiGateway** | Single entry point; per-service route files, JWT validation, token exchange, fixed-window rate limiting | YARP, gRPC client, Redis |
+| **Auth** | Registration, login (incl. Firebase ID-token login), JWT issuing, refresh and revocation, device sessions | ASP.NET Core Identity, PostgreSQL, Redis |
+| **Profile** | Person, patient and doctor profiles, medical history; owns subject-to-alias/patient/user mappings and serves them over gRPC | PostgreSQL, gRPC |
+| **Alias** | Anonymous public identities, alias labels, follow relationships, audit trail | PostgreSQL, Redis, outbox |
+| **Post** | Posts, nested comments, reactions, gifts and tags; moderation state | PostgreSQL, Redis locks, outbox, DDD layers |
+| **Feed** | Per-user timelines built by fan-out of approved posts, ranking and trending | ScyllaDB, Redis |
+| **AIModeration** | Moderates post content and alias labels | Gemini, PostgreSQL, gRPC |
+| **Media** | Media uploads, image moderation, AI-generated reward stickers | Azure Blob Storage, Sightengine, Gemini |
+| **ChatBox** | AI companion sessions: routing, tool selection, generation, rolling session summaries | Gemini, SignalR, PostgreSQL |
+| **UserMemory** | Long-term memory store and semantic search; session reward points and sticker claims | PostgreSQL + pgvector, Quartz, Gemini embeddings |
+| **RealtimeHub** | Pushes notifications, reward and progress updates to connected clients | SignalR, MassTransit consumers |
+| **Test** | DASS-21 psychological self-assessments | PostgreSQL |
+| **Wellness** | Wellness modules, challenges, mood journaling | PostgreSQL, outbox |
+| **Subscription** | Service packages and user subscriptions | PostgreSQL, gRPC client |
+| **Promotion** | Promo and gift codes, exposed as a gRPC service | gRPC, PostgreSQL |
+| **Payment** | Payment links and webhooks for subscriptions and bookings | PayOS, VNPay |
+| **DigitalGoods** | Digital goods catalogue and inventory grants | PostgreSQL, outbox |
+| **Translation** | Content translation exposed over gRPC | Gemini, PostgreSQL |
+
+> [!NOTE]
+> `Notification`, `Conversation`, `Scheduling`, `LifeStyles`, `Billing`, `Image` and `Wallet` also exist under `Services/`, but they are not included in `docker-compose-apis.yml` or the CI build matrix.
+
+## Key Workflows
+
+### 1. Token exchange and identity isolation
+
+**Problem.** Social services must not be able to link a public alias back to an account or to clinical data.
+
+**Implementation.** For each proxied request, a YARP request transform (`TokenExchangeTransformFactory`) reads the incoming token's subject, looks up the identifiers required by the destination service (`TokenExchangeRuleRegistry`), resolves them through Profile's gRPC PII service, and mints a new RSA-signed token for that audience. Minted tokens are cached in memory for 15 minutes; ID lookups are cached in Redis with a 1-hour sliding expiration, and each lookup has a 10-second timeout.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G as YARP Gateway
+    participant R as Redis
+    participant P as Profile (gRPC)
+    participant S as Downstream service
+    C->>G: Request + user JWT
+    G->>R: Cached alias/patient ID?
+    alt cache miss
+        G->>P: ResolveAliasIdBySubjectRef / ResolvePatientIdBySubjectRef
+        P-->>G: ID
+        G->>R: Cache (1h sliding)
+    end
+    G->>G: Mint audience-specific JWT (15 min)
+    G->>S: Forward request with internal token
+```
+
+**Trade-off.** Every request depends on the gateway and on Profile for ID resolution; the two cache layers keep that cost off the hot path.
+
+### 2. AI companion message processing
+
+1. ChatBox serialises processing per chat session, then prefixes the message with date/time context.
+2. `GeminiRouterClient` returns an intent (conversation, safety refusal, personal-memory retrieval, team-knowledge retrieval or tool calling) plus a decision on whether the message should be saved as a memory.
+3. For tool intents, `GeminiToolSelectorClient` chooses a tool (e.g. starting a DASS-21 test or playing relaxation music).
+4. When retrieval is needed, ChatBox calls UserMemory's `SearchMemories` gRPC method, which ranks stored memories by cosine distance in pgvector.
+5. Memories marked for saving are published as `UserMemoryCreatedIntegrationEvent`; UserMemory embeds them (`gemini-embedding-001`, 3072 dimensions by default) and stores them with emotion, relationship and topic tags.
+6. The reply is generated with Gemini and persisted. Once 14 new messages accumulate, ChatBox summarises them into the session's rolling summary, which is used as context for later turns.
+
+A `MessageProcessedIntegrationEvent` also updates the user's reward points in UserMemory; claimed rewards are processed by a Quartz job that asks Media to generate a sticker image, and RealtimeHub notifies the client.
+
+### 3. Event-driven post moderation with the outbox pattern
+
+```mermaid
+sequenceDiagram
+    participant Post
+    participant MQ as RabbitMQ
+    participant Mod as AIModeration
+    participant Feed
+    Post->>Post: Save post + outbox row (one transaction)
+    Post-->>MQ: OutboxProcessor publishes PostCreated
+    MQ-->>Mod: PostCreated
+    Mod->>Mod: Moderate content with Gemini
+    Mod-->>MQ: PostModerationEvaluated
+    MQ-->>Post: Approve or reject post
+    MQ-->>Feed: Fan out approved post to follower timelines
+```
+
+Post's `OutboxProcessor` is a `BackgroundService` that polls unprocessed rows in batches of 100 and marks them processed after publishing. Because the outbox row is written in the same transaction as the post, a crash between commit and publish delays the event instead of losing it; consumers must therefore tolerate duplicates.
+
+## Technology Stack
+
+| Area | Technologies |
+|---|---|
+| Backend | C#, .NET 9, ASP.NET Core, Carter (minimal APIs), MediatR (CQRS with validation, logging and idempotency behaviours), FluentValidation, EF Core, Mapster |
+| Gateway & communication | YARP reverse proxy, gRPC (Protobuf), JWT (RSA keys) |
+| Messaging | RabbitMQ via MassTransit, transactional outbox |
+| Data | PostgreSQL (one database per service), pgvector, ScyllaDB (Feed), Redis (cache, locks, idempotency) |
+| AI | Google Gemini (routing, generation, moderation, translation, image generation), Gemini embeddings |
+| Real-time | SignalR (ChatBox hub, RealtimeHub) |
+| Integrations | PayOS, VNPay, Firebase, Azure Blob Storage, Sightengine |
+| Background jobs | Quartz.NET, hosted `BackgroundService` workers |
+| Observability | Serilog, ASP.NET Core health checks (`/health` on each service) |
+| Delivery | Docker, Docker Compose, GitHub Actions, GitHub Container Registry |
+| Testing | xUnit, FluentAssertions, NSubstitute / Moq, AutoFixture, Testcontainers (PostgreSQL) |
+
+## Repository Structure
+
+```text
+.
+├── .github/workflows/            # Build, deploy and config-sync pipelines
+└── PsychologySupport/
+    ├── ApiGateways/
+    │   └── YarpApiGateway/       # Gateway, token exchange, per-service route files
+    ├── BuildingBlocks/
+    │   ├── BuildingBlocks/       # CQRS, DDD primitives, pipeline behaviours, idempotency
+    │   ├── BuildingBlocks.Messaging/  # MassTransit setup and shared integration events
+    │   └── BuildingBlocks.Observability/
+    ├── Services/                 # One folder per service (API or API/Application/Domain/Infrastructure)
+    ├── Directory.Packages.props  # Central NuGet package versions
+    ├── PsychologySupport.sln
+    ├── docker-compose-apis.yml   # Gateway, services and Redis
+    ├── docker-compose-databases.yml  # ScyllaDB and MongoDB
+    └── docker-compose.build.yml  # Image build definitions
+```
+
+## Getting Started
+
+> [!IMPORTANT]
+> Configuration files (`appsettings*.json`) are excluded by `.gitignore` and are synced to the server by dedicated workflows. To run the system you must create them yourself; the repository does not ship working configuration or credentials.
+
+### Prerequisites
+
+- .NET 9 SDK
+- Docker with Docker Compose
+- External dependencies not defined in the compose files: **PostgreSQL** (with the `pgvector` extension for UserMemory) and **RabbitMQ**
+- Accounts / keys for the integrations you want to use (Gemini, PayOS, VNPay, Firebase, Azure Blob Storage, Sightengine)
+
+### Configuration
+
+Each service reads standard ASP.NET Core configuration. Keys referenced in code include:
+
+- `ConnectionStrings:<Service>Db` (e.g. `PostDb`, `UserMemoryDb`, `AuthDb`) and `ConnectionStrings:Redis`
+- `MessageBroker:Host`, `MessageBroker:UserName`, `MessageBroker:Password`
+- `GrpcSettings:*` (URLs of gRPC dependencies, e.g. `GrpcSettings:PiiUrl`)
+- `Jwt:*`, `GeminiConfig:*`, `PayOS:*`, `Vnpay:*`, `Firebase:*`, `AzureBlobStorage:*`, `Sightengine:*`
+
+The compose file also mounts an HTTPS development certificate from `~/.aspnet/https` and RSA keys from each service's `RSAKeys/` folder.
+
+### Run with Docker Compose
+
+```bash
+cd PsychologySupport
+
+# Shared network used by all compose files
+docker network create emoease-net
+
+# ScyllaDB (Feed) and MongoDB; requires VPS_PUBLIC_IP in the environment
+docker compose -f docker-compose-databases.yml up -d
+
+# Build images (DOCKER_REGISTRY and IMAGE_TAG come from your .env file)
+docker compose -f docker-compose.build.yml build
+
+# Start the gateway, services and Redis
+docker compose --env-file .env -f docker-compose-apis.yml up -d
+```
+
+The gateway listens on port `8080`. Each service exposes `/health`, and the gateway proxies it as `/<service>-service/health` (for example `/aimoderation-service/health`).
+
+### Run a single service locally
+
+```bash
+cd PsychologySupport
+dotnet run --project Services/Post/Post.API
+```
+
+EF Core migrations live in each service's `Migrations` folders and are applied with the standard `dotnet ef database update` workflow.
+
+## Testing
+
+Automated tests currently cover the **Post** service:
+
+| Project | Scope |
+|---|---|
+| `Post.Tests.Domain.Unit` | Aggregate and value-object rules |
+| `Post.Tests.Application.Unit` | Command handlers |
+| `Post.Tests.Integration` | Post lifecycle flows, including outbox writes |
+| `Post.Tests.Contract` | Integration event contracts |
+
+```bash
+cd PsychologySupport
+dotnet test Services/Post/Post.Domain.UnitTests/Post.Tests.Domain.Unit.csproj
+dotnet test Services/Post/Post.Application.UnitTests/Post.Tests.Application.Unit.csproj
+```
+
+The test projects are not part of `PsychologySupport.sln`, so they are run by project path. Integration and contract tests use Testcontainers and require a running Docker daemon.
+
+## Architecture Documentation
+
+For service-by-service walkthroughs, data models and additional diagrams, see the **[DeepWiki documentation](https://deepwiki.com/anht04/psychology-support-microservices)**. Where DeepWiki and the source code differ, the source code is authoritative.
